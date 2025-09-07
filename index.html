@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/>
+  <title>Скелеты, босс и фаерболл — мини-игра</title>
+  <style>
+    html, body { margin:0; padding:0; background:#101418; height:100%; overflow:hidden; }
+    #hint {
+      position: fixed; left: 8px; top: 8px; z-index: 10;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      color: #cfd8dc; font-size: 14px; line-height: 1.35;
+      background: rgba(0,0,0,0.35); padding: 8px 10px; border-radius: 8px;
+      user-select: none; -webkit-user-select:none;
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.55.2/dist/phaser.js"></script>
+</head>
+<body>
+<div id="hint">
+  Движение: WASD / стрелки<br>
+  Удар: ПРОБЕЛ или «УДАР»&nbsp;&nbsp;|&nbsp;&nbsp;Фаерболл: F или «ФАЙР»<br>
+  Задача: победи скелетов → босса. После босса — новый уровень сложнее.
+</div>
+<script>
+(() => {
+  const config = {
+    type: Phaser.AUTO,
+    backgroundColor: "#172029",
+    scale: { mode: Phaser.Scale.RESIZE, width: window.innerWidth, height: window.innerHeight },
+    physics: { default: 'arcade', arcade: { gravity: { y: 0 }, debug: false } },
+    scene: { preload, create, update }
+  };
+  new Phaser.Game(config);
+
+  function preload() {}
+
+  function create() {
+    const { width, height } = this.scale;
+
+    // === Текстуры ===
+    genPlayerTex(this);
+    genSwordTex(this);
+    genSkeletonTex(this);
+    genSkeletonArcherTex(this);
+    genBossTex(this);
+    genButtonTex(this);
+    genArrowTex(this);
+    genFireballTex(this);
+
+    // === Состояние игры / сложность ===
+    this.level = 1;                       // текущий уровень
+    this.totalNormals = 3;                // число обычных скелетов до босса
+    this.defeatedCount = 0;               // сколько убито на текущем уровне
+
+    // === Группы ===
+    this.enemies = this.physics.add.group();
+    this.projectiles = this.physics.add.group(); // фаерболлы
+    this.arrows = this.physics.add.group();      // стрелы
+
+    // === Игрок ===
+    this.player = this.physics.add.sprite(width * 0.25, height * 0.55, 'player')
+      .setCollideWorldBounds(true);
+    this.player.speed = 240;
+    this.player.facing = new Phaser.Math.Vector2(1, 0);
+    this.player.hpMax = 5;
+    this.player.hp = this.player.hpMax;
+    this.player.alive = true;
+    this.player.iFrames = 0; // инвулн в секундах
+
+    // === Меч (хитбокс) ===
+    this.sword = this.physics.add.sprite(this.player.x, this.player.y, 'sword')
+      .setVisible(false).setImmovable(true);
+    this.sword.body.setAllowGravity(false);
+    this.isAttacking = false;
+    this.attackCooldown = 0;
+
+    // === Фаерболл ===
+    this.fireCooldown = 0;
+
+    // Столкновения/оверлапы
+    this.physics.add.collider(this.player, this.enemies);
+    this.physics.add.overlap(this.sword, this.enemies, onSwordHit, null, this);
+    this.physics.add.overlap(this.projectiles, this.enemies, onFireballHit, null, this);
+    this.physics.add.overlap(this.player, this.arrows, onPlayerHitByArrow, null, this);
+    this.physics.add.overlap(this.player, this.enemies, onPlayerTouchEnemy, null, this);
+
+    // === Управление ===
+    this.cursors = this.input.keyboard.createCursorKeys();
+    this.keys = this.input.keyboard.addKeys({
+      W: Phaser.Input.Keyboard.KeyCodes.W,
+      A: Phaser.Input.Keyboard.KeyCodes.A,
+      S: Phaser.Input.Keyboard.KeyCodes.S,
+      D: Phaser.Input.Keyboard.KeyCodes.D,
+      SPACE: Phaser.Input.Keyboard.KeyCodes.SPACE,
+      F: Phaser.Input.Keyboard.KeyCodes.F
+    });
+
+    // === Мобильные кнопки ===
+    this.mobile = { left:false, right:false, up:false, down:false, attack:false, fire:false };
+    buildTouchUI.call(this);
+
+    // === HUD ===
+    this.hud = this.add.text(12, height - 72, '', {
+      fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif',
+      fontSize: '16px', color: '#cfd8dc'
+    }).setDepth(5).setScrollFactor(0);
+
+    this.hud2 = this.add.text(12, height - 48, '', {
+      fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif',
+      fontSize: '16px', color: '#cfd8dc'
+    }).setDepth(5).setScrollFactor(0);
+
+    this.hudP = this.add.text(12, height - 24, '', {
+      fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif',
+      fontSize: '16px', color: '#cfd8dc'
+    }).setDepth(5).setScrollFactor(0);
+
+    this.scale.on('resize', (gameSize) => {
+      this.hud.setPosition(12, gameSize.height - 72);
+      this.hud2.setPosition(12, gameSize.height - 48);
+      this.hudP.setPosition(12, gameSize.height - 24);
+      positionTouchUI.call(this);
+    });
+
+    // Первая цель
+    spawnNextEnemy.call(this);
+    showLevelText.call(this, `Уровень ${this.level}`);
+  }
+
+  function update(_, dtMs) {
+    const dt = dtMs / 1000;
+
+    // === Движение игрока ===
+    const speed = this.player.speed;
+    let moveX = 0, moveY = 0;
+    if (this.cursors.left.isDown || this.keys.A.isDown || this.mobile.left)  moveX -= 1;
+    if (this.cursors.right.isDown || this.keys.D.isDown || this.mobile.right) moveX += 1;
+    if (this.cursors.up.isDown || this.keys.W.isDown || this.mobile.up)    moveY -= 1;
+    if (this.cursors.down.isDown || this.keys.S.isDown || this.mobile.down) moveY += 1;
+
+    const v = new Phaser.Math.Vector2(moveX, moveY);
+    if (v.length() > 0) {
+      v.normalize().scale(speed);
+      this.player.setVelocity(v.x, v.y);
+      this.player.facing.set(v.x, v.y).normalize();
+    } else {
+      this.player.setVelocity(0, 0);
+    }
+
+    // === Атака мечом ===
+    this.attackCooldown -= dt;
+    const attackPressed = Phaser.Input.Keyboard.JustDown(this.keys.SPACE) || this.mobile.attack;
+    if (attackPressed && this.attackCooldown <= 0 && this.player.alive) {
+      doAttack.call(this);
+      this.mobile.attack = false;
+    }
+
+    // === Фаерболл ===
+    this.fireCooldown -= dt;
+    const firePressed = Phaser.Input.Keyboard.JustDown(this.keys.F) || this.mobile.fire;
+    if (firePressed && this.fireCooldown <= 0 && this.player.alive) {
+      castFireball.call(this);
+      this.mobile.fire = false;
+    }
+
+    // === Ручное движение снарядов (фикс «не летят») ===
+    this.projectiles.getChildren().forEach(p => {
+      const vx = p.getData('vx') || 0, vy = p.getData('vy') || 0;
+      p.x += vx * dt; p.y += vy * dt;
+    });
+    this.arrows.getChildren().forEach(a => {
+      const vx = a.getData('vx') || 0, vy = a.getData('vy') || 0;
+      a.x += vx * dt; a.y += vy * dt;
+    });
+
+    // === «Интеллект» врагов ===
+    this.enemies.getChildren().forEach(e => {
+      if (!e.alive) return;
+
+      if (e.isBoss) {
+        // Босс преследует
+        const dir = new Phaser.Math.Vector2(this.player.x - e.x, this.player.y - e.y);
+        if (dir.length() > 6) {
+          dir.normalize().scale(140 + 10*(this.level-1));
+          e.setVelocity(dir.x, dir.y);
+        } else {
+          e.setVelocity(0, 0);
+        }
+      } else if (e.isArcher) {
+        // Лучник — кайт
+        const toP = new Phaser.Math.Vector2(this.player.x - e.x, this.player.y - e.y);
+        const dist = toP.length();
+        if (dist < 180) {
+          toP.normalize().scale(-160 - 10*(this.level-1));
+          e.setVelocity(toP.x, toP.y);
+        } else if (dist > 260) {
+          toP.normalize().scale(120 + 10*(this.level-1));
+          e.setVelocity(toP.x, toP.y);
+        } else {
+          e.setVelocity(0, 0);
+        }
+      } else {
+        // Мечник — преследование
+        const dir = new Phaser.Math.Vector2(this.player.x - e.x, this.player.y - e.y).normalize()
+          .scale(140 + 10*(this.level-1));
+        e.setVelocity(dir.x, dir.y);
+      }
+    });
+
+    // === i-frames и HUD ===
+    this.player.iFrames = Math.max(0, this.player.iFrames - dt);
+    updateHUD.call(this);
+  }
+
+  // ===== ПАРАМЕТРЫ СЛОЖНОСТИ =====
+  function paramsForLevel(L) {
+    return {
+      skelHP: 3 + (L - 1),               // HP скелетов
+      bossHP: 10 + 3*(L - 1),            // HP босса
+      arrowSpeed: 320 + 30*(L - 1),      // скорость стрел
+      bossArrowSpeed: 360 + 40*(L - 1),  // скорость стрел босса
+      archerChance: Math.min(0.45 + 0.08*(L - 1), 0.8) // шанс лучника
+    };
+  }
+
+  // ===== ВОЛНЫ =====
+  function spawnNextEnemy() {
+    const { width, height } = this.scale;
+    const P = paramsForLevel(this.level);
+
+    if (this.defeatedCount < this.totalNormals) {
+      const isArcher = Math.random() < P.archerChance;
+      const tex = isArcher ? 'skeletonArcher' : 'skeleton';
+      const enemy = this.physics.add.sprite(width * 0.72, height * 0.55, tex)
+        .setCollideWorldBounds(true);
+      enemy.hp = P.skelHP; enemy.alive = true; enemy.isArcher = isArcher; enemy.isBoss = false;
+
+      if (isArcher) {
+        enemy.shootEvent = this.time.addEvent({
+          delay: Phaser.Math.Between(900, 1400), loop: true,
+          callback: () => { if (enemy.alive) shootArrow.call(this, enemy, this.player, P.arrowSpeed); }
+        });
+      }
+      this.enemies.add(enemy);
+      this.currentEnemy = enemy;
+    } else {
+      // Босс
+      const boss = this.physics.add.sprite(width * 0.7, height * 0.55, 'boss')
+        .setCollideWorldBounds(true);
+      boss.hp = P.bossHP; boss.alive = true; boss.isBoss = true;
+
+      boss.shootEvent = this.time.addEvent({
+        delay: 1500 - Math.min(600, 80*(this.level-1)), loop: true,
+        callback: () => { if (boss.alive) bossVolley.call(this, boss, P.bossArrowSpeed); }
+      });
+
+      this.enemies.add(boss);
+      this.currentEnemy = boss;
+    }
+  }
+
+  function bossVolley(boss, speed) {
+    const toPlayer = new Phaser.Math.Vector2(this.player.x - boss.x, this.player.y - boss.y).normalize();
+    const baseAngle = Math.atan2(toPlayer.y, toPlayer.x);
+    const spread = Phaser.Math.DegToRad(15 + 2*(this.level-1)); // шире веер
+    const angles = [baseAngle - spread, baseAngle, baseAngle + spread];
+
+    angles.forEach(a => {
+      const vx = Math.cos(a) * speed, vy = Math.sin(a) * speed;
+      const arr = this.physics.add.sprite(boss.x, boss.y, 'arrow');
+      arr.body.setAllowGravity(false);
+      arr.setRotation(a);
+      arr.setVelocity(vx, vy);
+      arr.setData('vx', vx); arr.setData('vy', vy);
+      this.arrows.add(arr);
+      this.time.delayedCall(2200, () => arr.destroy());
+    });
+  }
+
+  // ===== БОЙ =====
+  function onSwordHit(_, enemy) {
+    if (!this.isAttacking || !enemy.alive) return;
+    this.isAttacking = false;
+    damageEnemy.call(this, enemy, 1);
+  }
+
+  function onFireballHit(fireball, enemy) {
+    if (!enemy.alive) return;
+    fireball.destroy();
+    damageEnemy.call(this, enemy, 1);
+  }
+
+  function damageEnemy(enemy, amount) {
+    enemy.hp -= amount;
+    flashTint(this, enemy, 0xff6b6b, 120);
+
+    if (enemy.hp <= 0 && enemy.alive) {
+      enemy.alive = false;
+      if (enemy.shootEvent) enemy.shootEvent.remove(false);
+      this.tweens.add({
+        targets: enemy, alpha: 0, angle: 15, duration: 300,
+        onComplete: () => {
+          enemy.disableBody(true, true);
+          if (enemy.isBoss) {
+            showLevelText.call(this, 'Победа над боссом!');
+            // Переход на следующий уровень: очистка и апгрейд сложности
+            this.time.delayedCall(900, () => {
+              clearAllProjectiles.call(this);
+              destroyAllEnemies.call(this);
+              this.level += 1;
+              this.defeatedCount = 0;
+              this.totalNormals = 3 + (this.level - 1);
+              resetPlayer.call(this, /*fullHeal*/ true);
+              showLevelText.call(this, `Уровень ${this.level}`);
+              this.time.delayedCall(600, () => spawnNextEnemy.call(this));
+            });
+          } else {
+            this.defeatedCount++;
+            this.time.delayedCall(this.defeatedCount < this.totalNormals ? 650 : 900, () => spawnNextEnemy.call(this));
+          }
+        }
+      });
+    }
+  }
+
+  function onPlayerHitByArrow(player, arrow) {
+    if (!this.player.alive) return;
+    arrow.destroy();
+    damagePlayer.call(this, 1);
+  }
+
+  function onPlayerTouchEnemy(player, enemy) {
+    if (!this.player.alive || !enemy.alive) return;
+    const dmg = enemy.isBoss ? 2 : 1;
+    damagePlayer.call(this, dmg);
+    // лёгкий отскок
+    const kb = new Phaser.Math.Vector2(player.x - enemy.x, player.y - enemy.y).normalize().scale(220);
+    player.setVelocity(kb.x, kb.y);
+  }
+
+  function damagePlayer(amount) {
+    if (this.player.iFrames > 0) return;
+    this.player.hp -= amount;
+    this.player.iFrames = 0.8; // 800 мс инвулна
+    flashTint(this, this.player, 0xffc107, 120);
+
+    if (this.player.hp <= 0) {
+      this.player.alive = false;
+      this.player.setVelocity(0, 0);
+      showLevelText.call(this, 'Поражение');
+      // остановить активность врагов, очистить поле и перезапустить текущий уровень
+      this.enemies.getChildren().forEach(e => { if (e.shootEvent) e.shootEvent.remove(false); if (e.tween) e.tween.stop(); });
+      this.time.delayedCall(900, () => {
+        clearAllProjectiles.call(this);
+        destroyAllEnemies.call(this);
+        // рестарт уровня без увеличения сложности
+        this.defeatedCount = 0;
+        resetPlayer.call(this, /*fullHeal*/ true);
+        showLevelText.call(this, `Повтор: уровень ${this.level}`);
+        this.time.delayedCall(600, () => spawnNextEnemy.call(this));
+      });
+    }
+  }
+
+  function clearAllProjectiles() {
+    this.projectiles.getChildren().forEach(p => p.destroy());
+    this.arrows.getChildren().forEach(a => a.destroy());
+  }
+
+  function destroyAllEnemies() {
+    this.enemies.getChildren().forEach(e => e.destroy());
+  }
+
+  // ===== ДЕЙСТВИЯ ИГРОКА =====
+  function doAttack() {
+    this.isAttacking = true;
+    this.attackCooldown = 0.28;
+
+    const fx = this.player.facing.x || 0;
+    const fy = this.player.facing.y || 0;
+    const off = 28;
+    const sx = this.player.x + off * (fx === 0 ? 0 : Math.sign(fx));
+    const sy = this.player.y + off * (fy === 0 ? 0 : Math.sign(fy));
+
+    this.sword.setPosition(sx, sy);
+    this.sword.setRotation(Math.atan2(fy, fx));
+    this.sword.setVisible(true);
+
+    this.time.delayedCall(140, () => {
+      this.sword.setVisible(false);
+      this.isAttacking = false;
+    });
+  }
+
+  function castFireball() {
+    this.fireCooldown = 0.45;
+    const fx = this.player.facing.x || 1;
+    const fy = this.player.facing.y || 0;
+    const dir = new Phaser.Math.Vector2(fx, fy).normalize();
+    const speed = 420;
+    const vx = dir.x * speed, vy = dir.y * speed;
+
+    const fb = this.physics.add.sprite(this.player.x + dir.x * 22, this.player.y + dir.y * 22, 'fireball');
+    fb.body.setAllowGravity(false);
+    fb.setVelocity(vx, vy);
+    fb.setRotation(Math.atan2(dir.y, dir.x));
+    fb.setData('vx', vx); fb.setData('vy', vy); // + ручной апдейт
+    this.projectiles.add(fb);
+    this.time.delayedCall(1200, () => fb.destroy());
+  }
+
+  // ===== СТРЕЛЫ ВРАГОВ =====
+  function shootArrow(shooter, target, speed=320) {
+    const dir = new Phaser.Math.Vector2(target.x - shooter.x, target.y - shooter.y).normalize();
+    const vx = dir.x * speed, vy = dir.y * speed;
+    const arr = this.physics.add.sprite(shooter.x, shooter.y, 'arrow');
+    arr.body.setAllowGravity(false);
+    arr.setRotation(Math.atan2(dir.y, dir.x));
+    arr.setVelocity(vx, vy);
+    arr.setData('vx', vx); arr.setData('vy', vy);
+    this.arrows.add(arr);
+    this.time.delayedCall(2000, () => arr.destroy());
+  }
+
+  // ===== HUD =====
+  function updateHUD() {
+    const phase = (this.defeatedCount < this.totalNormals)
+      ? `Уровень: ${this.level} | Скелеты: ${this.defeatedCount}/${this.totalNormals}`
+      : `Уровень: ${this.level} | Босс!`;
+    let hpText = '—';
+    if (this.currentEnemy && this.currentEnemy.alive) {
+      hpText = this.currentEnemy.isBoss ? `HP босса: ${this.currentEnemy.hp}` : `HP скелета: ${this.currentEnemy.hp}`;
+    }
+    this.hud.setText(phase);
+    this.hud2.setText(hpText);
+    this.hudP.setText(`HP игрока: ${Math.max(0, this.player.hp)}/${this.player.hpMax}`);
+  }
+
+  function showLevelText(msg) {
+    const { width, height } = this.scale;
+    const txt = this.add.text(width/2, height*0.25, msg, {
+      fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif',
+      fontSize: '28px', color: '#e0f2f1'
+    }).setOrigin(0.5).setDepth(10);
+    this.tweens.add({ targets: txt, y: height*0.22, duration: 600, yoyo:true, repeat:2, ease:'Sine.inOut',
+      onComplete: () => txt.destroy()
+    });
+  }
+
+  function flashTint(scene, sprite, color, ms=100) {
+    sprite.setTint(color);
+    scene.time.delayedCall(ms, () => sprite.clearTint());
+  }
+
+  // ===== МОБИЛЬНЫЕ КНОПКИ =====
+  function buildTouchUI() {
+    this.btnLeft  = this.add.image(0, 0, 'btnCircle').setInteractive().setScrollFactor(0).setAlpha(0.9);
+    this.btnRight = this.add.image(0, 0, 'btnCircle').setInteractive().setScrollFactor(0).setAlpha(0.9);
+    this.btnUp    = this.add.image(0, 0, 'btnCircle').setInteractive().setScrollFactor(0).setAlpha(0.9);
+    this.btnDown  = this.add.image(0, 0, 'btnCircle').setInteractive().setScrollFactor(0).setAlpha(0.9);
+
+    this.btnAttack = this.add.image(0, 0, 'btnRect').setInteractive().setScrollFactor(0).setAlpha(0.9);
+    this.btnAttackLabel = this.add.text(0, 0, 'УДАР', {
+      fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif', fontSize: '18px', color:'#e0f2f1'
+    }).setOrigin(0.5).setScrollFactor(0).setDepth(6);
+
+    this.btnFire = this.add.image(0, 0, 'btnRect').setInteractive().setScrollFactor(0).setAlpha(0.9);
+    this.btnFireLabel = this.add.text(0, 0, 'ФАЙР', {
+      fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif', fontSize: '18px', color:'#ffe082'
+    }).setOrigin(0.5).setScrollFactor(0).setDepth(6);
+
+    const press = (flag) => { this.mobile[flag] = true; };
+    const release = (flag) => { this.mobile[flag] = false; };
+
+    hookButton(this, this.btnLeft,  () => press('left'),  () => release('left'));
+    hookButton(this, this.btnRight, () => press('right'), () => release('right'));
+    hookButton(this, this.btnUp,    () => press('up'),    () => release('up'));
+    hookButton(this, this.btnDown,  () => press('down'),  () => release('down'));
+    hookButton(this, this.btnAttack,() => { this.mobile.attack = true; flashButton(this.btnAttack); }, () => {});
+    hookButton(this, this.btnFire,  () => { this.mobile.fire = true;   flashButton(this.btnFire);   }, () => {});
+
+    positionTouchUI.call(this);
+  }
+
+  function positionTouchUI() {
+    const { width, height } = this.scale;
+    const padX = 86, padY = height - 86;
+    const step = 78;
+
+    this.btnLeft.setPosition(padX - step, padY);
+    this.btnRight.setPosition(padX + step, padY);
+    this.btnUp.setPosition(padX, padY - step);
+    this.btnDown.setPosition(padX, padY + step);
+
+    const atkX = width - 90, atkY = height - 86;
+    const fireX = width - 90, fireY = height - 170;
+
+    this.btnAttack.setPosition(atkX, atkY); this.btnAttackLabel.setPosition(atkX, atkY);
+    this.btnFire.setPosition(fireX, fireY); this.btnFireLabel.setPosition(fireX, fireY);
+  }
+
+  function hookButton(scene, obj, onDown, onUp) {
+    obj.on('pointerdown', () => { obj.setAlpha(1); onDown(); });
+    obj.on('pointerup',   () => { obj.setAlpha(0.9); onUp(); });
+    obj.on('pointerout',  () => { obj.setAlpha(0.9); onUp(); });
+  }
+
+  function flashButton(obj) { obj.setTint(0x8fd3fe); setTimeout(()=>obj.clearTint(), 120); }
+
+  // ===== ТЕКСТУРЫ =====
+  function genPlayerTex(scene) {
+    const g = scene.make.graphics({ x: 0, y: 0, add: false });
+    g.fillStyle(0x3f51b5, 1); g.fillCircle(20, 20, 16);
+    g.fillStyle(0xffffff, 1); g.fillCircle(14,16,3); g.fillCircle(26,16,3);
+    g.generateTexture('player', 40, 40); g.destroy();
+  }
+
+  function genSwordTex(scene) {
+    const g = scene.make.graphics({ x: 0, y: 0, add: false });
+    g.fillStyle(0x6d4c41, 1); g.fillRect(0, 6, 10, 8);
+    g.fillStyle(0xb0bec5, 1); g.fillRect(10, 4, 6, 12);
+    g.fillStyle(0xcfd8dc, 1); g.fillRect(16, 7, 28, 6);
+    g.generateTexture('sword', 48, 20); g.destroy();
+  }
+
+  function genSkeletonTex(scene) {
+    const g = scene.make.graphics({ x: 0, y: 0, add: false });
+    g.fillStyle(0xe0e0e0, 1); g.fillRoundedRect(4, 0, 32, 24, 6);
+    g.fillStyle(0x1b1f24, 1); g.fillCircle(14, 10, 3); g.fillCircle(26, 10, 3);
+    g.fillStyle(0xffffff, 1); g.fillRect(10, 20, 20, 4);
+    g.lineStyle(3, 0xffffff, 1); g.strokeRect(8, 26, 24, 18);
+    g.lineBetween(8, 32, 2, 40);
+    g.lineBetween(32, 32, 38, 40);
+    g.generateTexture('skeleton', 40, 46); g.destroy();
+  }
+
+  function genSkeletonArcherTex(scene) {
+    const g = scene.make.graphics({ x: 0, y: 0, add: false });
+    // корпус
+    g.fillStyle(0xe0e0e0, 1); g.fillRoundedRect(4, 0, 32, 24, 6);
+    g.fillStyle(0x1b1f24, 1); g.fillCircle(14, 10, 3); g.fillCircle(26, 10, 3);
+    g.fillStyle(0xffffff, 1); g.fillRect(10, 20, 20, 4);
+    g.lineStyle(3, 0xffffff, 1); g.strokeRect(8, 26, 24, 18);
+    // лук справа — дуга
+    g.lineStyle(3, 0xffd54f, 1);
+    g.beginPath(); g.arc(34, 23, 14, -Math.PI/2, Math.PI/2, false); g.strokePath();
+    // тетива
+    g.lineStyle(1.5, 0xfff3e0, 1); g.lineBetween(34, 9, 34, 37);
+    g.generateTexture('skeletonArcher', 48, 48); g.destroy();
+  }
+
+  function genBossTex(scene) {
+    const g = scene.make.graphics({ x: 0, y: 0, add: false });
+    g.fillStyle(0xff8a80, 1); g.fillRoundedRect(6, 0, 52, 36, 8);
+    g.fillStyle(0x1b1f24, 1); g.fillCircle(24, 16, 4); g.fillCircle(40, 16, 4);
+    g.fillStyle(0xffffff, 1); g.fillRect(18, 30, 28, 6);
+    g.lineStyle(4, 0xffffff, 1); g.strokeRect(12, 40, 40, 28);
+    g.fillStyle(0xffd740, 1);
+    g.fillTriangle(14, 0, 22, -10, 30, 0);
+    g.fillTriangle(30, 0, 38, -10, 46, 0);
+    g.generateTexture('boss', 64, 72); g.destroy();
+  }
+
+  function genButtonTex(scene) {
+    const g = scene.make.graphics({ x: 0, y: 0, add: false });
+    g.fillStyle(0xffffff, 0.08); g.fillCircle(36, 36, 36);
+    g.lineStyle(2, 0xffffff, 0.25); g.strokeCircle(36, 36, 36);
+    g.generateTexture('btnCircle', 72, 72); g.destroy();
+
+    const g2 = scene.make.graphics({ x: 0, y: 0, add: false });
+    g2.fillStyle(0xffffff, 0.1); g2.fillRoundedRect(0, 0, 120, 60, 14);
+    g2.lineStyle(2, 0xffffff, 0.25); g2.strokeRoundedRect(0, 0, 120, 60, 14);
+    g2.generateTexture('btnRect', 120, 60); g2.destroy();
+  }
+
+  function genArrowTex(scene) {
+    const g = scene.make.graphics({ x: 0, y: 0, add: false });
+    g.fillStyle(0xb0bec5, 1); g.fillRect(0, 6, 18, 4);
+    g.fillStyle(0xcfd8dc, 1); g.fillTriangle(18, 8, 24, 6, 24, 10);
+    g.fillStyle(0x8d6e63, 1); g.fillRect(-4, 5, 4, 6);
+    g.generateTexture('arrow', 28, 16); g.destroy();
+  }
+
+  function genFireballTex(scene) {
+    const g = scene.make.graphics({ x: 0, y: 0, add: false });
+    g.fillStyle(0xff6d00, 1); g.fillCircle(10, 10, 8);
+    g.fillStyle(0xffd180, 1); g.fillCircle(10, 10, 4);
+    g.generateTexture('fireball', 20, 20); g.destroy();
+  }
+
+})();
+</script>
+</body>
+</html>
